@@ -112,9 +112,59 @@ impl FastqProcessor {
         self.align_qc.insert(modality, qc);
 
         let mut progress_bar = tqdm!(total = total_reads);
+        let mut first_alignments = true;
+        
         fq_reader.map(move |data| {
             let align_qc = self.align_qc.get_mut(&modality).unwrap();
             let results: Vec<_> = aligner.align_reads(num_threads, data);
+            
+            // Print debug info for first batch of alignments
+            if first_alignments {
+                debug!("First alignment batch contains {} results", results.len());
+                for (i, ali) in results.iter().take(3).enumerate() {
+                    match ali {
+                        (Some(ali1), Some(ali2)) => {
+                            debug!(
+                                "Alignment pair {}: Read1 has {} mappings, Read2 has {} mappings",
+                                i,
+                                ali1.len(),
+                                ali2.len()
+                            );
+                            if let Some(first_map1) = ali1.iter().next() {
+                                if let Some(ref_id) = first_map1.reference_sequence_id() {
+                                    debug!(
+                                        "Read1 first mapping: ref={:?}, pos={:?}, mapq={:?}, cigar={:?}",
+                                        header.reference_sequences()[ref_id],
+                                        first_map1.alignment_start(),
+                                        first_map1.mapping_quality(),
+                                        first_map1.cigar()
+                                    );
+                                }
+                            }
+                            if let Some(first_map2) = ali2.iter().next() {
+                                if let Some(ref_id) = first_map2.reference_sequence_id() {
+                                    debug!(
+                                        "Read2 first mapping: ref={:?}, pos={:?}, mapq={:?}, cigar={:?}",
+                                        header.reference_sequences()[ref_id],
+                                        first_map2.alignment_start(),
+                                        first_map2.mapping_quality(),
+                                        first_map2.cigar()
+                                    );
+                                }
+                            }
+                        }
+                        (Some(ali1), None) => {
+                            debug!("Single-end alignment {}: {} mappings", i, ali1.len());
+                        }
+                        (None, Some(ali2)) => {
+                            debug!("Single-end alignment {}: {} mappings", i, ali2.len());
+                        }
+                        _ => debug!("Alignment {}: No mappings", i),
+                    }
+                }
+                first_alignments = false;
+            }
+
             results.iter().for_each(|ali| match ali {
                 (Some(ali1), Some(ali2)) => {
                     align_qc.add_pair(&header, ali1, ali2).unwrap();
@@ -194,6 +244,8 @@ impl FastqProcessor {
             debug!("Set total_reads to {}", whitelists[0].total_count);
         }
 
+        // Add debug flag to print first few records
+        fq_reader.debug_first_records = true;
         debug!("Completed gen_barcoded_fastq setup");
         fq_reader
     }
@@ -289,6 +341,7 @@ pub struct AnnotatedFastqReader {
     readers: Vec<FastqReader>,
     chunk_size: usize,
     chunk: Vec<SmallVec<[fastq::Record; 4]>>,
+    debug_first_records: bool,
 }
 
 impl AnnotatedFastqReader {
@@ -400,6 +453,7 @@ impl FromIterator<(FastqAnnotator, FastqReader)> for AnnotatedFastqReader {
             trim_poly_a: false,
             chunk_size: 10000000,
             chunk,
+            debug_first_records: true,
         }
     }
 }
@@ -414,23 +468,58 @@ impl Iterator for AnnotatedFastqReader {
         } else {
             let n = (n / 256).max(256);
             let annotators = &self.annotators;
+            let debug_enabled = self.debug_first_records;
             let result = self
                 .chunk
                 .par_chunks(n)
                 .flat_map_iter(|chunk| {
-                    chunk.into_iter().map(move |records| {
-                        records
+                    chunk.into_iter().enumerate().map(move |(idx, records)| {
+                        let annotated = records
                             .iter()
                             .enumerate()
-                            .map(|(i, record)| annotators[i].annotate(record).unwrap())
+                            .map(|(i, record)| {
+                                let result = annotators[i].annotate(record).unwrap();
+                                if debug_enabled && idx < 3 {
+                                    info!("Record {}: Name={}", idx, String::from_utf8_lossy(record.name()));
+                                    if let Some(bc) = &result.barcode {
+                                        info!("  Barcode: raw={}, corrected={:?}", 
+                                            String::from_utf8_lossy(bc.raw.sequence()),
+                                            bc.corrected.as_ref().map(|s| String::from_utf8_lossy(s)));
+                                    }
+                                    if let Some(umi) = &result.umi {
+                                        info!("  UMI: {}", String::from_utf8_lossy(umi.sequence()));
+                                    }
+                                    if let Some(r1) = &result.read1 {
+                                        info!("  Read1 length: {}", r1.sequence().len());
+                                    }
+                                    if let Some(r2) = &result.read2 {
+                                        info!("  Read2 length: {}", r2.sequence().len());
+                                    }
+                                }
+                                result
+                            })
                             .reduce(|mut this, other| {
                                 this.join(other);
                                 this
                             })
-                            .unwrap()
+                            .unwrap();
+                        
+                        if debug_enabled && idx < 3 {
+                            info!("Final joined record {}", idx);
+                            if let Some(bc) = &annotated.barcode {
+                                info!("  Final barcode: raw={}, corrected={:?}",
+                                    String::from_utf8_lossy(bc.raw.sequence()),
+                                    bc.corrected.as_ref().map(|s| String::from_utf8_lossy(s)));
+                            }
+                        }
+                        
+                        annotated
                     })
                 })
                 .collect();
+
+            // Disable debug after first batch
+            self.debug_first_records = false;
             Some(result)
         }
     }

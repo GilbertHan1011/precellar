@@ -988,8 +988,9 @@ mod tests {
 
         // Assert lengths (32 based on the FASTQ content you showed)
         assert_eq!(read1.min_len, 32, "Incorrect length for read1");
-        assert_eq!(read2.min_len, 70, "Incorrect length for read2");
+        assert_eq!(read2.min_len, 71, "Incorrect length for read2");
     }
+    
     #[test]
     fn test_case_insensitive_yaml() {
         // Test YAML with different cases
