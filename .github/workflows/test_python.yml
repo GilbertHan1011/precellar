@@ -10,6 +10,11 @@ jobs:
     steps:
     - name: Checkout code
       uses: nschloe/action-cached-lfs-checkout@v1
+      
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake g++ libz-dev libbz2-dev liblzma-dev
 
     - uses: actions/setup-python@v5
       name: Install Python
