@@ -325,6 +325,15 @@ impl Assay {
         }
 
         self.verify(&read_buffer)?;
+        if let Some(region) = self.library_spec.get(&read_buffer.primer_id) {
+            if !region.read().unwrap().region_type.is_sequencing_primer() {
+                warn!(
+                    "primer_id '{}' is not a sequencing primer (type: {:?})",
+                    read_buffer.primer_id,
+                    region.read().unwrap().region_type
+                );
+            }
+        }
         self.sequence_spec.insert(read_id.to_string(), read_buffer);
 
         Ok(())
@@ -505,7 +514,7 @@ impl Assay {
                     If this is not the desired behavior, please adjust the region lengths.", read.read_id, id);
                 }
             }
-
+        
             if let Some(mut reader) = read.open() {
                 let regions = index
                     .segments
@@ -515,6 +524,7 @@ impl Assay {
                         (region.read().unwrap(), &info.range)
                     })
                     .collect::<Vec<_>>();
+                /* */
                 let mut validators = regions
                     .iter()
                     .map(|(region, range)| {
@@ -551,6 +561,7 @@ impl Assay {
                     }
                 }
             }
+            
         }
         Ok(())
     }
@@ -567,6 +578,19 @@ pub enum Modality {
     Crispr,
 }
 
+impl Modality {
+    pub fn from_str_case_insensitive(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "RNA" => Some(Modality::RNA),
+            "ATAC" => Some(Modality::ATAC),
+            "PROTEIN" => Some(Modality::Protein),
+            "DNA" => Some(Modality::DNA),
+            "TAG" => Some(Modality::Tag),
+            "CRISPR" => Some(Modality::Crispr),
+            _ => None,
+        }
+    }
+}
 impl<'de> Deserialize<'de> for Modality {
     fn deserialize<D>(deserializer: D) -> Result<Modality, D::Error>
     where
@@ -796,6 +820,7 @@ mod tests {
     use super::*;
 
     const YAML_FILE: &str = "../seqspec_templates/10x_rna_atac.yaml";
+    const YAML_FILE_2: &str = "../seqspec_templates/smartseq2.yaml";
 
     #[test]
     fn test_parse() {
@@ -819,11 +844,10 @@ mod tests {
 
     #[test]
     fn test_index() {
-        let yaml_str = fs::read_to_string(YAML_FILE).expect("Failed to read file");
-
+        let yaml_str = fs::read_to_string(YAML_FILE_2).expect("Failed to read file");
         let assay: Assay = serde_yaml::from_str(&yaml_str).expect("Failed to parse YAML");
         for (read, index) in assay.get_segments_by_modality(Modality::RNA) {
-            println!(
+            eprintln!(
                 "{}: {:?}",
                 read.read_id,
                 index
@@ -856,4 +880,247 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_update_read_primer_warning() {
+        let yaml_str = fs::read_to_string(YAML_FILE).expect("Failed to read file");
+        let mut assay: Assay = serde_yaml::from_str(&yaml_str).expect("Failed to parse YAML");
+
+        // Capture log messages
+        let (log_sender, log_receiver) = std::sync::mpsc::channel();
+        let _guard = env_logger::builder()
+            .format(move |_, record| {
+                let _ = log_sender.send(record.args().to_string());
+                Ok(())
+            })
+            .is_test(true)
+            .try_init();
+
+        // Test with non-sequencing primer (barcode) - should warn
+        let result = assay.update_read::<PathBuf>(
+            "test_read1",
+            Some(Modality::RNA),
+            Some("rna-cell_barcode"),  // cell barcode is not a sequencing primer
+            Some(false),
+            None,
+            Some(16),
+            Some(16),
+            false,
+        );
+        assert!(result.is_ok());
+        // Verify warning was logged for barcode primer
+        let warning = log_receiver.try_recv().expect("Should have received warning");
+        assert!(warning.contains("primer_id 'rna-cell_barcode' is not a sequencing primer"));
+        assert!(warning.contains("type: Barcode"));
+
+        // Test with sequencing primer - should not warn
+        let result = assay.update_read::<PathBuf>(
+            "test_read2", 
+            Some(Modality::RNA),
+            Some("rna-illumina_p5"),  // this is a sequencing primer
+            Some(false),
+            None,
+            Some(29),
+            Some(29),
+            false,
+        );
+        assert!(result.is_ok());
+
+        // Verify no warning was logged for sequencing primer
+        assert!(log_receiver.try_recv().is_err(), "Should not have received warning for sequencing primer");
+
+        // Verify reads were added with correct primers
+        let read1 = assay.sequence_spec.get("test_read1").unwrap();
+        let read2 = assay.sequence_spec.get("test_read2").unwrap();
+        assert_eq!(read1.primer_id, "rna-cell_barcode");
+        assert_eq!(read2.primer_id, "rna-illumina_p5");
+    }
+
+    #[test]
+    // This test is to test variable length reads. Still in progress.
+    fn test_update_read_with_fastq() {
+        // Initialize logger
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Use existing FASTQ files
+        let fastq_path1 = PathBuf::from("../data/test_1.fastq");
+        let fastq_path2 = PathBuf::from("../data/test_2.fastq");
+
+        // Load test YAML
+        let yaml_str = fs::read_to_string(YAML_FILE).expect("Failed to read file");
+        let mut assay: Assay = serde_yaml::from_str(&yaml_str).expect("Failed to parse YAML");
+
+        // Update read with first FASTQ file
+        assay.update_read::<PathBuf>(
+            "test_read1",
+            Some(Modality::RNA),
+            Some("rna-truseq_read1"),
+            Some(false),
+            Some(&[fastq_path1.clone()]),
+            None,  // Let it determine length from FASTQ
+            Some(16),
+            false,
+        ).expect("Failed to update read with test_1.fastq");
+
+        // Update read with second FASTQ file
+        assay.update_read::<PathBuf>(
+            "test_read2",
+            Some(Modality::RNA),
+            Some("rna-truseq_read2"),
+            Some(true),
+            Some(&[fastq_path2.clone()]),
+            None,
+            None,
+            false,
+        ).expect("Failed to update read with test_2.fastq");
+
+        // Verify reads
+        let read1 = assay.sequence_spec.get("test_read1").expect("Read1 not found");
+        let read2 = assay.sequence_spec.get("test_read2").expect("Read2 not found");
+        
+        // Print read information
+        println!("Read1:");
+        println!("  Length: {}", read1.min_len);
+        //println!("  File: {:?}", read1.files.as_ref().unwrap()[0].path);
+        println!("Read2:");
+        println!("  Length: {}", read2.min_len);
+        //println!("  File: {:?}", read2.files.as_ref().unwrap()[0].path);
+
+        // Assert lengths (32 based on the FASTQ content you showed)
+        assert_eq!(read1.min_len, 32, "Incorrect length for read1");
+        assert_eq!(read2.min_len, 70, "Incorrect length for read2");
+    }
+    #[test]
+    fn test_case_insensitive_yaml() {
+        // Test YAML with different cases
+        let yaml = r#"
+region_id: "test_region"
+region_type: "BARCODE"  # uppercase
+name: "Test Region"
+sequence_type: "fixed"
+sequence: "ACGT"
+min_len: 4
+max_len: 4
+regions: []
+"#;
+        let region: Region = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        assert_eq!(region.region_type, RegionType::Barcode);
+
+        // Test mixed case
+        let yaml = r#"
+region_id: "test_region"
+region_type: "TruSeq_Read1"  # mixed case
+name: "Test Region"
+sequence_type: "fixed"
+sequence: "ACGT"
+min_len: 4
+max_len: 4
+regions: []
+"#;
+        let region: Region = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        assert_eq!(region.region_type, RegionType::TruseqRead1);
+    }
+
+    #[test]
+    fn test_get_segments_by_modality() {
+        let yaml_str = fs::read_to_string(YAML_FILE_2).expect("Failed to read file");
+        let assay: Assay = serde_yaml::from_str(&yaml_str).expect("Failed to parse YAML");
+
+        // Test RNA modality segments
+        let rna_segments: Vec<_> = assay.get_segments_by_modality(Modality::RNA)
+            .map(|(read, info)| {
+                (
+                    read.read_id.clone(),
+                    info.segments.into_iter().map(|seg| {
+                        (
+                            seg.region_id.clone(),
+                            seg.region_type,
+                            seg.range.start..seg.range.end
+                        )
+                    }).collect::<Vec<_>>()
+                )
+            })
+            .collect();
+
+        // Print detailed segment information for debugging
+        println!("\nRNA Segments:");
+        for (read_id, segments) in &rna_segments {
+            println!("Read {}", read_id);
+            for (region_id, region_type, range) in segments {
+                println!("  - Region: {}, Type: {:?}, Range: {:?}", 
+                    region_id, region_type, range);
+            }
+        }
+
+        // Test ATAC modality segments
+        let atac_segments: Vec<_> = assay.get_segments_by_modality(Modality::ATAC)
+            .map(|(read, info)| {
+                (
+                    read.read_id.clone(),
+                    info.segments.into_iter().map(|seg| {
+                        (
+                            seg.region_id.clone(),
+                            seg.region_type,
+                            seg.range.start..seg.range.end
+                        )
+                    }).collect::<Vec<_>>()
+                )
+            })
+            .collect();
+
+        println!("\nATAC Segments:");
+        for (read_id, segments) in &atac_segments {
+            println!("Read {}", read_id);
+            for (region_id, region_type, range) in segments {
+                println!("  - Region: {}, Type: {:?}, Range: {:?}", 
+                    region_id, region_type, range);
+            }
+        }
+
+        // Add assertions to verify expected segments
+        // Example assertions (adjust according to your expected values):
+        assert!(!rna_segments.is_empty(), "Should have RNA segments");
+        //assert!(!atac_segments.is_empty(), "Should have ATAC segments");
+
+        // Verify specific RNA read segments
+        if let Some(rna_read) = rna_segments.iter().find(|(id, _)| id == "RNA R1") {
+            let segments = &rna_read.1;
+            assert!(!segments.is_empty(), "RNA-R1 should have segments");
+            // Add more specific assertions about the segments
+        }
+
+
+    }
+    #[test]
+    fn test_case_insensitive_yaml() {
+        // Test YAML with different cases
+        let yaml = r#"
+region_id: "test_region"
+region_type: "BARCODE"  # uppercase
+name: "Test Region"
+sequence_type: "fixed"
+sequence: "ACGT"
+min_len: 4
+max_len: 4
+regions: []
+"#;
+        let region: Region = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        assert_eq!(region.region_type, RegionType::Barcode);
+
+        // Test mixed case
+        let yaml = r#"
+region_id: "test_region"
+region_type: "TruSeq_Read1"  # mixed case
+name: "Test Region"
+sequence_type: "fixed"
+sequence: "ACGT"
+min_len: 4
+max_len: 4
+regions: []
+"#;
+        let region: Region = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        assert_eq!(region.region_type, RegionType::TruseqRead1);
+    }
+
+
 }

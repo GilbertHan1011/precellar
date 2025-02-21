@@ -21,10 +21,9 @@ Core functions
 .. autosummary::
     :toctree: _autosummary
 
-    make_genome_index
     align
-    make_fragment
     make_fastq
+    make_bwa_index
 
 
 Aligners
@@ -44,3 +43,4 @@ Utilities
 
     utils.strip_barcode_from_fastq
     utils.bam_to_fastq
+    utils.merge_fastq_files
