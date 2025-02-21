@@ -53,7 +53,8 @@ jobs:
         cd ${GITHUB_WORKSPACE}/python
         mkdir ${GITHUB_WORKSPACE}/wheel_files
         maturin build --release --strip
-        cp target/wheels/*.whl ${GITHUB_WORKSPACE}/wheel_files/
+        cp python/target/wheels/*.whl ${GITHUB_WORKSPACE}/wheel_files/ || cp target/wheels/*.whl ${GITHUB_WORKSPACE}/wheel_files/
+
 
     - name: Test Python package
       run: |
