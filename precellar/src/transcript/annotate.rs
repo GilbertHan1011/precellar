@@ -187,16 +187,9 @@ impl AlignmentAnnotator {
             read.alignment_end().unwrap().get() as u64,
         );
         
-        // Print read information
-        println!("Read information:");
-        println!("  Chromosome: {}", chrom);
-        println!("  Alignment start: {}", read.alignment_start().unwrap().get());
-        println!("  Alignment end: {}", read.alignment_end().unwrap().get());
         
         // Find overlapping transcripts and print transcriptome information
         let overlapping_transcripts: Vec<_> = self.transcripts.find(&region).collect();
-        println!("Transcriptome information:");
-        println!("  Found {} overlapping transcripts", overlapping_transcripts.len());
 
         
         let alignments = self
@@ -281,25 +274,18 @@ impl AlignmentAnnotator {
 
         // Determine aggregated splice state
         let aggregated_splice_state = if !splice_aware {
-            println!("Splice-aware mode disabled, setting state to Undetermined");
             SpliceState::Undetermined
         } else if annotation_region == AnnotationRegion::Intergenic {
-            println!("Annotation region is Intergenic, setting splice state to Intergenic");
             SpliceState::Intergenic
         } else if all_splice_states.is_empty() {
-            println!("No splice states found, setting state to Undetermined (this should not happen)");
             SpliceState::Undetermined // This case should never happen
         } else if all_splice_states.iter().any(|&state| state == SpliceState::Unspliced) {
-            println!("Found at least one Unspliced state in {:?}, setting aggregated state to Unspliced", all_splice_states);
             SpliceState::Unspliced
         } else if all_splice_states.iter().all(|&state| state == SpliceState::Spliced) {
-            println!("All states are Spliced in {:?}, setting aggregated state to Spliced", all_splice_states);
             SpliceState::Spliced
         } else if model.iter().any(|m| *m != model[0]) {
-            println!("Models are inconsistent {:?}, setting splice state to Ambiguous", model);
             SpliceState::Ambiguous
         } else {
-            println!("Model {:?}, defaulting to Unspliced", model);
             SpliceState::Unspliced
         };
 
