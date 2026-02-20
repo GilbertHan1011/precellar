@@ -31,6 +31,12 @@ pub enum ChemistryStrandedness {
     Unstranded,
 }
 
+#[derive(Debug, Clone)]
+pub enum ReadSegmentPlan {
+    Fixed(SegmentInfo),
+    AutoRc { forward: SegmentInfo, reverse: SegmentInfo },
+}
+
 /// Assay struct contains the information parsed from the sequence spec YAML file
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Assay {
@@ -437,6 +443,36 @@ impl Assay {
         // We truncate the segments to the max_len of the read because otherwise
         // all segments will contain barcodes and cause issues in barcode counting step.
         Some(segments)
+    }
+
+    /// Get strand-aware segment plan for one read.
+    ///
+    /// - Pos/Neg: returns a single fixed SegmentInfo (already oriented by read.strand)
+    /// - Unstranded: prefers both forward and reverse SegmentInfo for runtime auto-RC choice;
+    ///   if the reverse topology cannot be built, falls back to forward-only Fixed plan.
+    pub fn get_segment_plan(&self, read_id: &str) -> Option<ReadSegmentPlan> {
+        let read = self.sequence_spec.get(read_id)?;
+        let library_parent_region = self.library_spec.get_parent(&read.primer_id)?;
+        let parent = library_parent_region.read().unwrap();
+
+        match read.strand {
+            Strand::Unstranded => {
+                if let Some((forward, reverse)) = read.get_both_segments(&parent, true) {
+                    Some(ReadSegmentPlan::AutoRc { forward, reverse })
+                } else {
+                    warn!(
+                        "Could not build reverse segments for unstranded read '{}'; falling back to forward-only plan",
+                        read_id
+                    );
+                    let segments = read.get_segments(&parent, true)?;
+                    Some(ReadSegmentPlan::Fixed(segments))
+                }
+            }
+            Strand::Pos | Strand::Neg => {
+                let segments = read.get_segments(&parent, true)?;
+                Some(ReadSegmentPlan::Fixed(segments))
+            }
+        }
     }
 
     /// Return the barcode-whitelist map for a given modality.

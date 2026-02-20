@@ -395,6 +395,11 @@ impl SegmentInfo {
     }
 
     /// Split by trying both forward and reverse segment layouts and return the best-scoring result.
+    ///
+    /// Selection priority:
+    /// 1. More barcode segments extracted (structural completeness for single-cell)
+    /// 2. More target/genomic segments extracted
+    /// 3. Fewer mismatches
     pub fn split_auto_rc<'a>(
         fwd_info: &'a SegmentInfo,
         rev_info: &'a SegmentInfo,
