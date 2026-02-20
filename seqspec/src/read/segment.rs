@@ -96,6 +96,13 @@ pub struct SegmentInfo {
     is_reverse: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SplitResult<'a> {
+    pub segments: Vec<Segment<'a>>,
+    pub mismatches: usize,
+    pub is_reverse: bool,
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum SplitError {
     AnchorNotFound,
@@ -172,17 +179,30 @@ impl SegmentInfo {
 
     /// Split a read into segments according to the segment information.
     ///
-    /// # Arguments
-    ///
-    /// * `read` - The read to split
-    /// * `linker_tolerance` - The fraction of mismatches allowed for the linker sequence
-    /// * `anchor_tolerance` - The fraction of mismatches allowed for the anchor sequence
+    /// Backward-compatible wrapper over split_with_score.
     pub fn split_with_tolerance<'a>(
         &'a self,
         read: &'a fastq::Record,
         linker_tolerance: f64,
         anchor_tolerance: f64,
     ) -> Result<Vec<Segment<'a>>, SplitError> {
+        self.split_with_score(read, linker_tolerance, anchor_tolerance)
+            .map(|res| res.segments)
+    }
+
+    /// Split a read into segments according to the segment information.
+    ///
+    /// # Arguments
+    ///
+    /// * `read` - The read to split
+    /// * `linker_tolerance` - The fraction of mismatches allowed for the linker sequence
+    /// * `anchor_tolerance` - The fraction of mismatches allowed for the anchor sequence
+    pub fn split_with_score<'a>(
+        &'a self,
+        read: &'a fastq::Record,
+        linker_tolerance: f64,
+        anchor_tolerance: f64,
+    ) -> Result<SplitResult<'a>, SplitError> {
         fn consume_buf<'a>(
             buf: &mut Vec<&'a SegmentInfoElem>,
             mut seq: &'a [u8],
@@ -234,6 +254,7 @@ impl SegmentInfo {
         let mut result = Vec::new();
         let mut min_offset = 0;
         let mut max_offset = 0;
+        let mut total_mismatches = 0usize;
         let mut buffer: Vec<&SegmentInfoElem> = Vec::new();
         let len = read.sequence().len();
 
@@ -265,6 +286,7 @@ impl SegmentInfo {
                         if let (Some(pos), mis) = match_result
                         {
                             if mis as f64 <= anchor_tolerance * segment.sequence.len() as f64 {
+                                total_mismatches += mis;
                                 // [offset_left, offset_right] is the region of the read that
                                 // contains segments prior to the matched pattern
                                 let offset_left =
@@ -331,6 +353,7 @@ impl SegmentInfo {
                         if d as f64 > linker_tolerance * seq.len() as f64 {
                             return Err(SplitError::PatternMismatch(d as usize));
                         }
+                        total_mismatches += d as usize;
                     }
 
                     result.push(Segment::new(
@@ -364,7 +387,36 @@ impl SegmentInfo {
             );
         }
 
-        Ok(result)
+        Ok(SplitResult {
+            segments: result,
+            mismatches: total_mismatches,
+            is_reverse: self.is_reverse,
+        })
+    }
+
+    /// Split by trying both forward and reverse segment layouts and return the best-scoring result.
+    pub fn split_auto_rc<'a>(
+        fwd_info: &'a SegmentInfo,
+        rev_info: &'a SegmentInfo,
+        read: &'a fastq::Record,
+        linker_tolerance: f64,
+        anchor_tolerance: f64,
+    ) -> Result<SplitResult<'a>, SplitError> {
+        let res_fwd = fwd_info.split_with_score(read, linker_tolerance, anchor_tolerance);
+        let res_rev = rev_info.split_with_score(read, linker_tolerance, anchor_tolerance);
+
+        match (res_fwd, res_rev) {
+            (Ok(fwd), Ok(rev)) => {
+                if fwd.mismatches <= rev.mismatches {
+                    Ok(fwd)
+                } else {
+                    Ok(rev)
+                }
+            }
+            (Ok(fwd), Err(_)) => Ok(fwd),
+            (Err(_), Ok(rev)) => Ok(rev),
+            (Err(e), Err(_)) => Err(e),
+        }
     }
 }
 

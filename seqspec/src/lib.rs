@@ -484,15 +484,25 @@ impl Assay {
             .get_parent(&read.primer_id)
             .ok_or_else(|| anyhow!("Primer not found: {}", read.primer_id))?;
         // Check if the primer exists
-        if let Some(segment_info) = read.get_segments(&region.read().unwrap(), true) {
+        if let Some((fwd_info, rev_info)) = read.get_both_segments(&region.read().unwrap(), true) {
             if let Some(mut reader) = read.open() {
                 let mut onlists = HashMap::new();
                 let mut total_reads = 0;
                 let mut invalid = 0;
                 reader.records().take(sample_size).try_for_each(|record| {
                     total_reads += 1;
-                    if let Ok(segments) = segment_info.split_with_tolerance(&record?, 0.2, 0.2) {
-                        segments.iter().for_each(|segment| {
+                    let record = record?;
+
+                    let split_result = match read.strand {
+                        Strand::Unstranded => {
+                            SegmentInfo::split_auto_rc(&fwd_info, &rev_info, &record, 0.2, 0.2)
+                        }
+                        Strand::Pos => fwd_info.split_with_score(&record, 0.2, 0.2),
+                        Strand::Neg => rev_info.split_with_score(&record, 0.2, 0.2),
+                    };
+
+                    if let Ok(split_res) = split_result {
+                        split_res.segments.iter().for_each(|segment| {
                             if segment.is_barcode() {
                                 let id = segment.region_id();
                                 if let Some((onlist, n_matched)) =
@@ -504,7 +514,7 @@ impl Assay {
                                         ))
                                     })
                                 {
-                                    let seq_in_onlist = if segment_info.is_reverse() {
+                                    let seq_in_onlist = if split_res.is_reverse {
                                         onlist.contains(&rev_compl(segment.seq))
                                     } else {
                                         onlist.contains(segment.seq)

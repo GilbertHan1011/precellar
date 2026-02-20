@@ -1,7 +1,7 @@
 mod segment;
 use crate::region::Region;
 use crate::Modality;
-pub use segment::{Segment, SegmentInfo, SegmentInfoElem, SplitError};
+pub use segment::{Segment, SegmentInfo, SegmentInfoElem, SplitError, SplitResult};
 
 use anyhow::{bail, Result};
 use file_download::download::Downloader;
@@ -175,17 +175,36 @@ impl Read {
     pub fn is_reverse(&self) -> bool {
         match self.strand {
             Strand::Neg => true,
-            Strand::Pos => false,
+            Strand::Pos | Strand::Unstranded => false,
         }
     }
 
     pub(crate) fn get_segments<'a>(&'a self, region: &'a Region, truncate_by_length: bool) -> Option<SegmentInfo> {
+        self.get_segments_oriented(region, truncate_by_length, self.is_reverse())
+    }
+
+    pub(crate) fn get_both_segments<'a>(
+        &'a self,
+        region: &'a Region,
+        truncate_by_length: bool,
+    ) -> Option<(SegmentInfo, SegmentInfo)> {
+        let fwd = self.get_segments_oriented(region, truncate_by_length, false)?;
+        let rev = self.get_segments_oriented(region, truncate_by_length, true)?;
+        Some((fwd, rev))
+    }
+
+    fn get_segments_oriented<'a>(
+        &'a self,
+        region: &'a Region,
+        truncate_by_length: bool,
+        is_reverse: bool,
+    ) -> Option<SegmentInfo> {
         if !region.sequence_type.is_joined() {
             return None;
         }
 
         let subregions = region.subregions.iter();
-        let subregions: Box<dyn Iterator<Item = _>> = if self.is_reverse() {
+        let subregions: Box<dyn Iterator<Item = _>> = if is_reverse {
             Box::new(subregions.rev())
         } else {
             Box::new(subregions)
@@ -200,7 +219,7 @@ impl Read {
             }) // Skip until we find the primer region
             .skip(1)
             .map(|x| x.read().unwrap().deref().clone());
-        let mut segment_info = SegmentInfo::new(segment_info, self.is_reverse());
+        let mut segment_info = SegmentInfo::new(segment_info, is_reverse);
         if truncate_by_length {
             segment_info = segment_info.truncate_max(self.max_len as usize);
         }
@@ -217,6 +236,7 @@ impl Read {
 pub enum Strand {
     Pos,
     Neg,
+    Unstranded,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
