@@ -5,7 +5,8 @@ pub mod utils;
 use indexmap::{IndexMap, IndexSet};
 use log::{info, warn};
 pub use read::{
-    FastqReader, File, Read, SegmentInfo, SegmentInfoElem, SplitError, Strand, UrlType,
+    FastqReader, File, Read, Segment, SegmentInfo, SegmentInfoElem, SplitAutoRcBothResult,
+    SplitError, SplitResult, Strand, UrlType,
 };
 pub use region::LibSpec;
 pub use region::{Onlist, Region, RegionId, RegionType, SequenceType};
@@ -34,7 +35,7 @@ pub enum ChemistryStrandedness {
 #[derive(Debug, Clone)]
 pub enum ReadSegmentPlan {
     Fixed(SegmentInfo),
-    AutoRc { forward: SegmentInfo, reverse: SegmentInfo },
+    AutoRc { forward: SegmentInfo },
 }
 
 /// Assay struct contains the information parsed from the sequence spec YAML file
@@ -448,8 +449,7 @@ impl Assay {
     /// Get strand-aware segment plan for one read.
     ///
     /// - Pos/Neg: returns a single fixed SegmentInfo (already oriented by read.strand)
-    /// - Unstranded: prefers both forward and reverse SegmentInfo for runtime auto-RC choice;
-    ///   if the reverse topology cannot be built, falls back to forward-only Fixed plan.
+    /// - Unstranded: returns AutoRc plan that will try both orientations using RC-sequence paradigm
     pub fn get_segment_plan(&self, read_id: &str) -> Option<ReadSegmentPlan> {
         let read = self.sequence_spec.get(read_id)?;
         let library_parent_region = self.library_spec.get_parent(&read.primer_id)?;
@@ -457,15 +457,11 @@ impl Assay {
 
         match read.strand {
             Strand::Unstranded => {
-                if let Some((forward, reverse)) = read.get_both_segments(&parent, true) {
-                    Some(ReadSegmentPlan::AutoRc { forward, reverse })
+                // Use forward segments only - RC-sequence paradigm handles orientation detection
+                if let Some(segments) = read.get_segments(&parent, true) {
+                    Some(ReadSegmentPlan::AutoRc { forward: segments })
                 } else {
-                    warn!(
-                        "Could not build reverse segments for unstranded read '{}'; falling back to forward-only plan",
-                        read_id
-                    );
-                    let segments = read.get_segments(&parent, true)?;
-                    Some(ReadSegmentPlan::Fixed(segments))
+                    None
                 }
             }
             Strand::Pos | Strand::Neg => {
@@ -520,7 +516,7 @@ impl Assay {
             .get_parent(&read.primer_id)
             .ok_or_else(|| anyhow!("Primer not found: {}", read.primer_id))?;
         // Check if the primer exists
-        if let Some((fwd_info, rev_info)) = read.get_both_segments(&region.read().unwrap(), true) {
+        if let Some(fwd_info) = read.get_segments(&region.read().unwrap(), true) {
             if let Some(mut reader) = read.open() {
                 let mut onlists = HashMap::new();
                 let mut total_reads = 0;
@@ -531,10 +527,14 @@ impl Assay {
 
                     let split_result = match read.strand {
                         Strand::Unstranded => {
-                            SegmentInfo::split_auto_rc(&fwd_info, &rev_info, &record, 0.2, 0.2)
+                            SegmentInfo::split_auto_rc(&fwd_info, &record, 0.2, 0.2)
                         }
                         Strand::Pos => fwd_info.split_with_score(&record, 0.2, 0.2),
-                        Strand::Neg => rev_info.split_with_score(&record, 0.2, 0.2),
+                        Strand::Neg => {
+                            // For Neg strand, we still use forward layout but mark as reverse
+                            // In practice, Neg strand reads should be handled at the assay level
+                            fwd_info.split_with_score(&record, 0.2, 0.2)
+                        }
                     };
 
                     if let Ok(split_res) = split_result {

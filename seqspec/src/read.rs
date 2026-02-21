@@ -1,7 +1,7 @@
 mod segment;
 use crate::region::Region;
 use crate::Modality;
-pub use segment::{Segment, SegmentInfo, SegmentInfoElem, SplitError, SplitResult};
+pub use segment::{Segment, SegmentInfo, SegmentInfoElem, SplitAutoRcBothResult, SplitError, SplitResult};
 
 use anyhow::{bail, Result};
 use file_download::download::Downloader;
