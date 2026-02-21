@@ -527,13 +527,13 @@ impl Assay {
 
                     let split_result = match read.strand {
                         Strand::Unstranded => {
-                            SegmentInfo::split_auto_rc(&fwd_info, &record, 0.2, 0.2)
+                            SegmentInfo::split_auto_rc(&fwd_info, &record, 0.2, 0.2, 0.0)
                         }
-                        Strand::Pos => fwd_info.split_with_score(&record, 0.2, 0.2),
+                        Strand::Pos => fwd_info.split_with_tolerance(&record, 0.2, 0.2, 0.0),
                         Strand::Neg => {
                             // For Neg strand, we still use forward layout but mark as reverse
                             // In practice, Neg strand reads should be handled at the assay level
-                            fwd_info.split_with_score(&record, 0.2, 0.2)
+                            fwd_info.split_with_tolerance(&record, 0.2, 0.2, 0.0)
                         }
                     };
 

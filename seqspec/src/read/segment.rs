@@ -1,8 +1,17 @@
 use std::ops::Range;
 
+use editdistancek::edit_distance_bounded;
 use noodles::fastq::{self, record::Definition};
 
 use crate::{utils::hamming_distance, Region, RegionType, SequenceType};
+
+/// Result of anchor search when indels are allowed: position, actual match length, and edit distance.
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorMatch {
+    pub start_pos: usize,
+    pub match_len: usize,
+    pub edit_distance: usize,
+}
 
 #[derive(Debug, Clone)]
 pub enum SegmentType<'a> {
@@ -205,22 +214,9 @@ impl SegmentInfo {
     }
 
     /// Split a read into segments according to the segment information.
-    /// This function uses a default tolerance of 1.0 for the linker sequence and 0.2 for the anchor sequence,
-    /// which means that we do not check the sequence of the linker and allow up to 20% mismatches for the anchor sequence.
+    /// Uses default tolerances (1.0, 0.2) and no anchor indels (ratio 0).
     pub fn split<'a>(&'a self, read: &'a fastq::Record) -> Result<Vec<Segment<'a>>, SplitError> {
-        self.split_with_tolerance(read, 1.0, 0.2)
-    }
-
-    /// Split a read into segments according to the segment information.
-    ///
-    /// Backward-compatible wrapper over split_with_score.
-    pub fn split_with_tolerance<'a>(
-        &'a self,
-        read: &'a fastq::Record,
-        linker_tolerance: f64,
-        anchor_tolerance: f64,
-    ) -> Result<Vec<Segment<'a>>, SplitError> {
-        self.split_with_score(read, linker_tolerance, anchor_tolerance)
+        self.split_with_tolerance(read, 1.0, 0.2, 0.0)
             .map(|res| res.segments)
     }
 
@@ -231,11 +227,16 @@ impl SegmentInfo {
     /// * `read` - The read to split
     /// * `linker_tolerance` - The fraction of mismatches allowed for the linker sequence
     /// * `anchor_tolerance` - The fraction of mismatches allowed for the anchor sequence
-    pub fn split_with_score<'a>(
+    /// * `anchor_max_indels_ratio` - Ratio of anchor length for max indels (e.g. 0.1 → cap 1 for 8 bp). 0 = Hamming only.
+    ///
+    /// # Returns
+    /// `SplitResult` with segments, mismatch count, and orientation.
+    pub fn split_with_tolerance<'a>(
         &'a self,
         read: &'a fastq::Record,
         linker_tolerance: f64,
         anchor_tolerance: f64,
+        anchor_max_indels_ratio: f64,
     ) -> Result<SplitResult<'a>, SplitError> {
         fn consume_buf<'a>(
             buf: &mut Vec<&'a SegmentInfoElem>,
@@ -296,9 +297,20 @@ impl SegmentInfo {
             let min_len = segment.min_len();
             let max_len = segment.max_len();
 
-            // Check if the segment is within the read bounds
-            if max_offset >= len || min_offset + min_len > len {
-                //if max_offset + min_len > len {
+            // Check if the segment is within the read bounds.
+            // If it's a fixed segment (anchor), allow it to be shorter by up to cap_from_ratio (deletions).
+            let anchor_cap = if segment.sequence_type.is_fixed() && anchor_max_indels_ratio > 0.0 {
+                (min_len as f64 * anchor_max_indels_ratio).ceil() as usize
+            } else {
+                0
+            };
+            let allowed_min_len = if segment.sequence_type.is_fixed() {
+                min_len.saturating_sub(anchor_cap)
+            } else {
+                min_len
+            };
+
+            if max_offset >= len || min_offset + allowed_min_len > len {
                 break;
             }
 
@@ -307,29 +319,50 @@ impl SegmentInfo {
                     // if the sequcence contains fixed patterns, we can try to use them as anchors
                     // to find the location of the next segment
                     if segment.sequence_type.is_fixed() {
-                        // by definition, the pattern can only be found within the window defined by [min_offset, max_offset+max_len]
                         let search_start = min_offset;
-                        let search_end = len.min(max_offset + max_len);
+                        let needle = if self.is_reverse {
+                            segment.rc_sequence.as_slice()
+                        } else {
+                            segment.sequence.as_bytes()
+                        };
+                        // Cap from ratio (e.g. 0.1 * 8 = 0.8 → 1)
+                        let cap_from_ratio = if anchor_max_indels_ratio > 0.0 {
+                            (needle.len() as f64 * anchor_max_indels_ratio).ceil() as usize
+                        } else {
+                            0
+                        };
+                        // Allow the window to expand to catch insertions
+                        let window_expansion = cap_from_ratio;
+                        let search_end = len.min(max_offset + max_len + window_expansion);
                         let seq = read
                             .sequence()
                             .get(search_start..search_end)
                             .unwrap();
 
-                        let match_result = if self.is_reverse {
-                            find_best_pattern_match(seq, segment.rc_sequence.as_slice())
+                        // Dual-gate: k_bound = min(ratio-based, cap from ratio); k_bound == 0 => Hamming only
+                        let allowed_by_ratio =
+                            (anchor_tolerance * needle.len() as f64).floor() as usize;
+                        let k_bound = allowed_by_ratio.min(cap_from_ratio);
+
+                        let anchor_match = if k_bound == 0 {
+                            let (pos_opt, mis) = find_best_pattern_match(seq, needle);
+                            pos_opt.map(|pos| AnchorMatch {
+                                start_pos: pos,
+                                match_len: needle.len(),
+                                edit_distance: mis,
+                            })
                         } else {
-                            find_best_pattern_match(seq, segment.sequence.as_bytes())
+                            find_best_indel_pattern_match(seq, needle, k_bound)
                         };
 
-                        if let (Some(pos), mis) = match_result
-                        {
-                            if mis as f64 <= anchor_tolerance * segment.sequence.len() as f64 {
-                                total_mismatches += mis;
-                                // [offset_left, offset_right] is the region of the read that
-                                // contains segments prior to the matched pattern
+                        if let Some(match_result) = anchor_match {
+                            let max_allowed_by_ratio =
+                                (anchor_tolerance * needle.len() as f64).floor() as usize;
+                            if match_result.edit_distance <= max_allowed_by_ratio {
+                                total_mismatches += match_result.edit_distance;
                                 let offset_left =
                                     min_offset - buffer.iter().map(|s| s.min_len()).sum::<usize>();
-                                let offset_right = min_offset + pos;
+                                let offset_right = min_offset + match_result.start_pos;
 
                                 consume_buf(
                                     &mut buffer,
@@ -340,18 +373,16 @@ impl SegmentInfo {
                                     &mut result,
                                 );
 
-                                // as the lengths of the previous segments are identified, we can now
-                                // update the min_offset and max_offset
-                                min_offset = offset_right;
-                                max_offset = offset_right;
+                                min_offset = offset_right + match_result.match_len;
+                                max_offset = min_offset;
 
-                                let seq = read
+                                let anchor_seq = read
                                     .sequence()
-                                    .get(offset_right..offset_right + max_len)
+                                    .get(offset_right..offset_right + match_result.match_len)
                                     .unwrap();
-                                let qual = read
+                                let anchor_qual = read
                                     .quality_scores()
-                                    .get(offset_right..offset_right + max_len)
+                                    .get(offset_right..offset_right + match_result.match_len)
                                     .unwrap();
 
                                 result.push(Segment::new(
@@ -359,18 +390,26 @@ impl SegmentInfo {
                                         region_id: segment.region_id.as_str(),
                                         region_type: segment.region_type,
                                     },
-                                    seq,
-                                    qual,
-                                ))
+                                    anchor_seq,
+                                    anchor_qual,
+                                ));
+                                // Offsets already advanced by match_len; skip loop-tail increment
+                                continue;
                             } else if max_offset + max_len > len {
-                                // if the pattern is not found near read end, treat as structural failure
-                                // instead of silently returning a partial split
-                                return Err(SplitError::AnchorNotFound);
+                                // Read too short to contain anchor; break and flush buffer.
+                                break;
                             } else {
-                                return Err(SplitError::PatternMismatch(mis));
+                                return Err(SplitError::PatternMismatch(
+                                    match_result.edit_distance,
+                                ));
                             }
                         } else {
-                            return Err(SplitError::AnchorNotFound);
+                            // No anchor match; if read is too short, break and flush buffer.
+                            if max_offset + max_len > len {
+                                break;
+                            } else {
+                                return Err(SplitError::AnchorNotFound);
+                            }
                         }
                     } else {
                         buffer.push(segment);
@@ -438,23 +477,19 @@ impl SegmentInfo {
 
     /// Automatically try both orientations using sequence RC and coordinate mapping.
     ///
-    /// Delegates to `split_auto_rc_both` and selects one result: fewer mismatches wins; on tie, forward.
+    /// Delegates to `split_auto_rc_both`. When both parse, prefers forward (two-phase callers use barcode to choose).
     pub fn split_auto_rc<'a>(
         fwd_info: &'a SegmentInfo,
         read: &'a fastq::Record,
         linker_tolerance: f64,
         anchor_tolerance: f64,
+        anchor_max_indels_ratio: f64,
     ) -> Result<SplitResult<'a>, SplitError> {
-        let both_res = Self::split_auto_rc_both(fwd_info, read, linker_tolerance, anchor_tolerance)?;
+        let both_res =
+            Self::split_auto_rc_both(fwd_info, read, linker_tolerance, anchor_tolerance, anchor_max_indels_ratio)?;
         match both_res {
             SplitAutoRcBothResult::One(res) => Ok(res),
-            SplitAutoRcBothResult::Both { forward, reverse } => {
-                if reverse.mismatches < forward.mismatches {
-                    Ok(reverse)
-                } else {
-                    Ok(forward)
-                }
-            }
+            SplitAutoRcBothResult::Both { forward, .. } => Ok(forward),
         }
     }
 
@@ -465,10 +500,17 @@ impl SegmentInfo {
         read: &'a fastq::Record,
         linker_tolerance: f64,
         anchor_tolerance: f64,
+        anchor_max_indels_ratio: f64,
     ) -> Result<SplitAutoRcBothResult<'a>, SplitError> {
-        let res_fwd = fwd_info.split_with_score(read, linker_tolerance, anchor_tolerance);
+        let res_fwd =
+            fwd_info.split_with_tolerance(read, linker_tolerance, anchor_tolerance, anchor_max_indels_ratio);
         let rc_read = make_rc_record(read);
-        let res_rev = fwd_info.split_with_score(&rc_read, linker_tolerance, anchor_tolerance);
+        let res_rev = fwd_info.split_with_tolerance(
+            &rc_read,
+            linker_tolerance,
+            anchor_tolerance,
+            anchor_max_indels_ratio,
+        );
         let read_len = read.sequence().len();
 
         match (res_fwd, res_rev) {
@@ -588,7 +630,7 @@ pub struct SegmentInfoElem {
     pub region_type: RegionType,
     pub sequence_type: SequenceType,
     pub sequence: String,
-    /// Precomputed reverse complement of sequence; avoids allocs in split_with_score when is_reverse.
+    /// Precomputed reverse complement of sequence; avoids allocs in split_with_tolerance when is_reverse.
     pub rc_sequence: Vec<u8>,
     pub len: Range<usize>, // length of the segment
 }
@@ -669,6 +711,71 @@ fn find_pattern(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 ///
 /// # Arguments
 ///
+/// Sliding-window k-bounded Levenshtein search for anchor matching with indels.
+/// Returns best match by smallest edit distance, then by length closest to needle.len().
+fn find_best_indel_pattern_match(
+    haystack: &[u8],
+    needle: &[u8],
+    max_indels: usize,
+) -> Option<AnchorMatch> {
+    if needle.is_empty() || haystack.is_empty() {
+        return None;
+    }
+    let m = needle.len();
+    let n = haystack.len();
+    let min_l = m.saturating_sub(max_indels);
+    let max_l = m.saturating_add(max_indels);
+    if min_l > max_l || n < min_l {
+        return None;
+    }
+
+    let mut best_match: Option<AnchorMatch> = None;
+    for i in 0..=n.saturating_sub(min_l) {
+        let max_window_len = (n - i).min(max_l);
+        for l in min_l..=max_window_len {
+            let window = &haystack[i..i + l];
+            if let Some(d) = edit_distance_bounded(needle, window, max_indels) {
+                let is_better = match &best_match {
+                    None => true,
+                    Some(cur) => {
+                        if d < cur.edit_distance {
+                            true // 1. Lowest edit distance always wins
+                        } else if d == cur.edit_distance {
+                            if i < cur.start_pos {
+                                true // 2. Prefer leftmost match (closest to expected biological coordinate)
+                            } else if i == cur.start_pos {
+                                // 3. Same start: prefer length closest to expected needle length
+                                let new_len_diff = l.abs_diff(m);
+                                let cur_len_diff = cur.match_len.abs_diff(m);
+                                if new_len_diff < cur_len_diff {
+                                    true
+                                } else if new_len_diff == cur_len_diff {
+                                    // 4. Ultimate tie-breaker: prefer shorter consumption
+                                    l < cur.match_len
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false // i > cur.start_pos: deeper in read (false positive risk)
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if is_better {
+                    best_match = Some(AnchorMatch {
+                        start_pos: i,
+                        match_len: l,
+                        edit_distance: d,
+                    });
+                }
+            }
+        }
+    }
+    best_match
+}
+
 /// * `haystack` - The sequence to search in
 /// * `needle` - The pattern to search for
 ///
@@ -899,4 +1006,119 @@ mod tests {
         let info = SegmentInfo::new(info, false);
         println!("{:?}", info.truncate_max(50));
     }
+
+    #[test]
+    fn test_anchor_indel_tolerance() {
+        // Layout: bc(4) + var(1,2) + linker("ACGT"). Read 9 bp: "AAAA" + "A" + "ACGX" (1 sub in linker).
+        let elems = [bc(4), var(1, 2), linker("ACGT")];
+        let info = SegmentInfo::new(elems, false);
+        let read = new_fq("AAAAAACGX");
+        // anchor_tolerance 0.3 -> max_allowed_by_ratio = 1 so 1 edit is accepted
+        // ratio 0.1 → cap 1 for 4 bp needle (0.1 * 4 = 0.4 → ceil = 1)
+        let res_indel = info.split_with_tolerance(&read, 0.3, 0.3, 0.1);
+        assert!(
+            res_indel.is_ok(),
+            "split with anchor_max_indels_ratio=0.1 (cap 1) should succeed: {:?}",
+            res_indel
+        );
+        let split = res_indel.unwrap();
+        assert_eq!(split.segments.len(), 3, "barcode + var + linker");
+        let anchor_seg = split.segments.last().unwrap();
+        // Coordinate-priority tie-breaker: same i, prefer length closest to needle (4 bp). So we take "ACGX" (4 bp, 1 sub).
+        assert_eq!(anchor_seg.seq, b"ACGX", "anchor segment (1 edit accepted; length closest to needle)");
+    }
+
+    /// True insertion: linker grows by 1 bp; search window expands and downstream cDNA is still correct.
+    #[test]
+    fn test_anchor_insertion_tolerance() {
+        let elems = [bc(4), var(1, 2), linker("ACGT"), cdna(3, 10)];
+        let info = SegmentInfo::new(elems, false);
+        // "AAAA" (bc) + "A" (var) + "ACXGT" (linker with inserted X) + "CCCC" (cDNA) = 14 bp
+        let read = new_fq("AAAAAACXGTCCCC");
+
+        // ratio 0.1 → cap 1 for 4 bp linker
+        let res = info.split_with_tolerance(&read, 1.0, 0.3, 0.1);
+        assert!(res.is_ok(), "Insertion should be accepted: {:?}", res);
+
+        let split = res.unwrap();
+        assert_eq!(split.segments.len(), 4);
+
+        assert_eq!(split.segments[2].seq, b"ACXGT", "Anchor should be 5 bp due to insertion");
+        assert_eq!(split.segments[3].seq, b"CCCC", "Downstream cDNA still correct");
+    }
+
+    /// Dual-gate rejection: ratio limits allowed edits; read with 2 substitutions is rejected even if absolute cap is high.
+    /// Uses var(0, 4) so the anchor branch is taken. Read length must be >= max_offset + max_len (12) so we don't
+    /// trigger the "short read" graceful break (which would flush buffer instead of returning an error).
+    #[test]
+    fn test_anchor_dual_gate_rejection() {
+        let elems = [bc(4), var(0, 4), linker("ACGT")];
+        let info = SegmentInfo::new(elems, false);
+        // Read: "AAAA" + "ACXX" + "YYY" so len=12 -> max_offset+max_len (12) not > len; we return error, not break.
+        let read = new_fq("AAAAACXXXYYY");
+
+        // anchor_tolerance 0.3 -> k_bound = 1; ratio 1.25 → cap 5 for 4 bp; we reject because ratio limits edits to 1.
+        let res = info.split_with_tolerance(&read, 1.0, 0.3, 1.25);
+
+        assert!(
+            res.is_err(),
+            "Should reject read because ratio limits edits to 1, even if cap from ratio is 5"
+        );
+
+        match res {
+            Err(SplitError::AnchorNotFound) => {}
+            Err(SplitError::PatternMismatch(dist)) => assert_eq!(dist, 2, "Should report 2 mismatches"),
+            Ok(_) => panic!("Expected an error"),
+        }
+    }
+
+    /// scNanopore-like layout; Read 2 has one error per anchor (seq1=+1bp, seq2=1 sub, seq3=1 del).
+    /// Verifies that with tolerance and anchor_max_indels_ratio the split finds all anchors.
+    #[test]
+    fn test_scnanopore_anchor_one_error_each() {
+        use crate::RegionType;
+        let leading = SegmentInfoElem::new(
+            "leading_primer",
+            RegionType::Linker,
+            SequenceType::Fixed,
+            "TGTACTTCGT",
+            10,
+            10,
+        );
+        let seq1 = linker("AATGATACGGCGACCACCGAGATCT");
+        let seq2 = linker("TCGTCGGCAGCGTC");
+        let seq3 = linker("AGATGTGTATAAGAGACAG");
+        let gdna = SegmentInfoElem::new("gdna", RegionType::Gdna, SequenceType::Random, "N", 1, 100_000);
+        let elems = [
+            leading,
+            var(0, 80),
+            seq1,
+            var(22, 26), // pcr_barcode
+            seq2,
+            var(22, 26), // tn5_barcode
+            seq3,
+            gdna,
+        ];
+        let info = SegmentInfo::new(elems, false);
+        // Read 2: seq1 has extra C (ins), seq2 has A instead of G (sub), seq3 has one T missing (del).
+        let read2 = "TGTACTTCGTTCAGTTACGTACTAATGATACGGCGACCACCGAGATCTCCACAGTGTCAACTAGAGCCTCTCTCGTCAGCAGCGTCAAGCGTTGAAACCTTTGTCCTCTCAGATGTATAAGAGACAGGTTGAATACACACAAC";
+        let record = new_fq(read2);
+        // Relaxed tolerance so one edit per anchor is accepted.
+        let res = info.split_with_tolerance(&record, 0.1, 0.2, 0.1);
+        assert!(
+            res.is_ok(),
+            "Read 2 (seq1=+1bp, seq2=1sub, seq3=1del) should parse: {:?}",
+            res
+        );
+        let split = res.unwrap();
+        assert_eq!(
+            split.segments.len(),
+            8,
+            "expected 8 segments: leading, unfixed, seq1, pcr_barcode, seq2, tn5_barcode, seq3, gdna"
+        );
+        let gdna_seg = split.segments.last().unwrap();
+        assert!(!gdna_seg.seq.is_empty(), "gdna segment should be non-empty");
+    }
+
+   
 }
